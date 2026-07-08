@@ -4,8 +4,10 @@ from transformers import AutoTokenizer
 
 
 def main():
+    # TODO:为什么需要使用transformers库函数？
     path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
     tokenizer = AutoTokenizer.from_pretrained(path)
+    # TODO:为什么写一个空函数在这里？
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
 
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
@@ -13,6 +15,7 @@ def main():
         "introduce yourself",
         "list all prime numbers within 100",
     ]
+    # TODO:为什么要多处理这一步？
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],

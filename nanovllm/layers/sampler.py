@@ -3,7 +3,7 @@ from torch import nn
 
 
 class Sampler(nn.Module):
-
+    # TODO:这个是什么意思？为什么要compile以及这个Sample的作用是什么？logits是什么？这个函数的作用是什么？计算公式是什么？
     @torch.compile
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
         logits = logits.float().div_(temperatures.unsqueeze(dim=1))

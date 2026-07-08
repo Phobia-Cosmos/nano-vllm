@@ -184,6 +184,7 @@ class Qwen3Model(nn.Module):
 
 
 class Qwen3ForCausalLM(nn.Module):
+    # TODO:每一个Model都会有这个mapping吗？其中的内容都是什么意思？
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -198,7 +199,9 @@ class Qwen3ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.model = Qwen3Model(config)
+        # TODO:这个是在配置什么？
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        # TODO:这个是什么意思？
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
@@ -208,7 +211,7 @@ class Qwen3ForCausalLM(nn.Module):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         return self.model(input_ids, positions)
-
+    # TODO:这个函数的作用是什么？
     def compute_logits(
         self,
         hidden_states: torch.Tensor,

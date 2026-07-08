@@ -5,6 +5,7 @@ from itertools import count
 from nanovllm.sampling_params import SamplingParams
 
 
+# TODO:auto()代表什么意思？
 class SequenceStatus(Enum):
     WAITING = auto()
     RUNNING = auto()
@@ -12,19 +13,24 @@ class SequenceStatus(Enum):
 
 
 class Sequence:
+    # TODO:为什么要有block_size？counter是一个Sequence内部的序号吗？为什么要用这个不直接使用index?
     block_size = 256
     counter = count()
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+        # TODO:next是什么意思？
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
+        # TODO:num_tokens和num_prompt_tokens不是一样的吗？
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
         self.num_scheduled_tokens = 0
+        # TODO:prefill/decode？
         self.is_prefill = True
+        # TODO:存储的是什么？
         self.block_table = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens

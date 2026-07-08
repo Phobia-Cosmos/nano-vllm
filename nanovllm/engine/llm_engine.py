@@ -10,6 +10,7 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.models.minigpt import MiniGPTCharTokenizer
 
 
 class LLMEngine:
@@ -21,24 +22,32 @@ class LLMEngine:
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
+        # TODO:multiprocessing有那些context？都是用来做什么的？
         ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size):
+            # TODO:这个event是torch内部分配的吗？
             event = ctx.Event()
             process = ctx.Process(target=ModelRunner, args=(config, i, event))
             process.start()
             self.ps.append(process)
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        if getattr(config.hf_config, "model_type", "") == "minigpt":
+            self.tokenizer = MiniGPTCharTokenizer.from_pretrained(config.model)
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
 
     def exit(self):
-        self.model_runner.call("exit")
-        del self.model_runner
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is not None:
+            model_runner.call("exit")
+            del self.model_runner
         for p in self.ps:
             p.join()
+        self.ps = []
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):

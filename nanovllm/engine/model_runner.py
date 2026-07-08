@@ -7,13 +7,14 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.minigpt import MiniGPTForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
 
 class ModelRunner:
-
+    # TODO:rank的作用是什么？
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
@@ -28,26 +29,42 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        self.is_minigpt = getattr(hf_config, "model_type", "") == "minigpt"
+        if self.is_minigpt:
+            self.model = MiniGPTForCausalLM(hf_config)
+        else:
+            self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
+        self.model.eval()
+        # TODO:Sampler的作用是什么？
         self.sampler = Sampler()
-        self.warmup_model()
-        self.allocate_kv_cache()
-        if not self.enforce_eager:
-            self.capture_cudagraph()
+        if self.is_minigpt:
+            # MiniGPT is a teaching backend: it re-computes full context and does not own a paged KV cache yet.
+            config.num_kvcache_blocks = max(config.max_num_seqs * 2, 16)
+        else:
+            # TODO:什么叫做warmup model以及为什么先warmup在分配kvcache？
+            self.warmup_model()
+            self.allocate_kv_cache()
+            # TODO:为什么要计算cudagraph？
+            if not self.enforce_eager:
+                self.capture_cudagraph()
+        # TODO:为什么要设置cpu？
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+                # TODO:barrier目的是阻断某些访问是吗？
                 dist.barrier()
             else:
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
+                # TODO:为什么要loop？针对非rank0的单独创建shm？为什么针对rank0单独处理？
                 self.loop()
 
     def exit(self):
+        # TODO：为什么要先close在unlink？
         if self.world_size > 1:
             self.shm.close()
             dist.barrier()
@@ -55,6 +72,7 @@ class ModelRunner:
                 self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
+        # TODO:这一步的目的是什么？
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -67,8 +85,10 @@ class ModelRunner:
 
     def read_shm(self):
         assert self.world_size > 1 and self.rank > 0
+        # TODO:需要先读取内存内容才可以开始事件吗？
         self.event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
+        # TODO:这个是什么意思以及为什么要clear？
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
         self.event.clear()
         return method_name, args
@@ -79,20 +99,24 @@ class ModelRunner:
         n = len(data)
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
+        # TODO:这个是在set什么？
         for event in self.event:
             event.set()
 
     def call(self, method_name, *args):
         if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
+        # TODO:这个是将函数写到内存中去然后在调用是吗？CUDA需要这样编程吗？
         method = getattr(self, method_name, None)
         return method(*args)
 
     def warmup_model(self):
+        # TODO:清空的是GPU内部的cache吗？
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         seq_len = min(max_num_batched_tokens, max_model_len)
+        # TODO:为什么要max_num_batched_tokens // seq_len？
         num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
@@ -105,15 +129,20 @@ class ModelRunner:
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
+        # TODO：used和current区别是什么？peak作用是什么？
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        # TODO:这个属性作用是什么？
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        # TODO:为什么要传入三个值才可以get？
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
+        # TODO:为什么kv_cache还与hidden_layer相关？
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
+        # TODO:model.modules都是什么？以及每一层layer都有一个单独的kv-cache吗？
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
@@ -122,18 +151,22 @@ class ModelRunner:
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
+        # TODO:为什么要这样赋值？原理是什么？为什么是一个数组加上一个数字？
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+        # TODO:这里存储的是什么？pin_memory作用是什么？什么叫做non_blocking？
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
+        # TODO:cu_seqlens_q和k是什么意思？slot_mapping作用？
         cu_seqlens_q = [0]
         cu_seqlens_k = [0]
         max_seqlen_q = 0
         max_seqlen_k = 0
         slot_mapping = []
+        # TODO:这个属性作用是什么？
         block_tables = None
         for seq in seqs:
             start = seq.num_cached_tokens
@@ -142,12 +175,15 @@ class ModelRunner:
             seqlen_k = end
             input_ids.extend(seq[start:end])
             positions.extend(range(start, end))
+            # TODO:下面两行是在做什么？
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+            # TODO:为什么要计算max？
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:    # warmup
                 continue
+            # TODO:何时会走到这个代码 而不是上面的continue？
             start_block = start // self.block_size
             end_block = (end + self.block_size - 1) // self.block_size
             for i in range(start_block, end_block):
@@ -159,6 +195,7 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
+        # TODO:为什么要比较这两个 原理是什么？
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -166,6 +203,7 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        # TODO:这里是在cuda中做什么？
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
@@ -176,8 +214,10 @@ class ModelRunner:
         context_lens = []
         for seq in seqs:
             input_ids.append(seq.last_token)
+            # TODO:为什么保存的是seq的长度来充当位置？
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
+            # TODO:block_table中存储的是什么？和seq的关系是什么？
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -188,15 +228,19 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
+        # TODO:为什么针对每一个seq都有不同的temper？
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        # TODO:为什么input_ids.size(0) > 512也可以开始？为什么是or逻辑？else的逻辑是什么？
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+            # TODO:这里计算出来的结果是什么？
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
+            # TODO:这个是什么？
             bs = input_ids.size(0)
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
@@ -212,17 +256,27 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        if getattr(self, "is_minigpt", False):
+            temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+            logits = self.model.logits_for_sequences([seq.token_ids for seq in seqs])
+            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            return token_ids
+
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        # TODO:为什么temper需要看rank的值？
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
+        # TODO:logits计算出来是确定的 token id是不确定的吧？随温度变化？
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 
+    # TODO:为什么有一个@？
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
+        # TODO:为什么需要max bs--最长的序列长度？
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
@@ -231,19 +285,24 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        # TODO:这个属性是什么？
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        # TODO:graphs和graph_pool的区别是什么？
         self.graphs = {}
         self.graph_pool = None
 
         for bs in reversed(self.graph_bs):
+            # TODO:CUDAGraph保存的什么信息？graph.pool()是什么？
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            # TODO:这三行计算的原理是什么？
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
+            # TODO:为什么要同步？
             torch.cuda.synchronize()
             reset_context()
 
