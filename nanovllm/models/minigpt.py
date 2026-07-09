@@ -5,6 +5,7 @@ from pathlib import Path
 import torch
 from torch import nn
 import torch.nn.functional as F
+from tokenizers import Tokenizer
 
 
 class MiniGPTCharTokenizer:
@@ -17,7 +18,10 @@ class MiniGPTCharTokenizer:
 
     @classmethod
     def from_pretrained(cls, path: str):
-        payload = json.loads((Path(path) / "tokenizer.json").read_text())
+        tokenizer_path = Path(path) / "tokenizer.json"
+        payload = json.loads(tokenizer_path.read_text())
+        if "stoi" not in payload:
+            return MiniGPTHFTokenizer(tokenizer_path)
         return cls(
             stoi={str(k): int(v) for k, v in payload["stoi"].items()},
             itos=[str(x) for x in payload["itos"]],
@@ -33,6 +37,19 @@ class MiniGPTCharTokenizer:
             token = self.itos[int(idx)]
             pieces.append("?" if token == self.unk_token else token)
         return "".join(pieces)
+
+
+class MiniGPTHFTokenizer:
+    def __init__(self, tokenizer_path: str | Path):
+        self.tokenizer = Tokenizer.from_file(str(tokenizer_path))
+        eos_token_id = self.tokenizer.token_to_id("<eos>")
+        self.eos_token_id = -1 if eos_token_id is None else eos_token_id
+
+    def encode(self, text: str) -> list[int]:
+        return self.tokenizer.encode(text, add_special_tokens=False).ids
+
+    def decode(self, ids: list[int], skip_special_tokens: bool = False, **_: object) -> str:
+        return self.tokenizer.decode([int(idx) for idx in ids], skip_special_tokens=skip_special_tokens)
 
 
 class MiniGPTAttention(nn.Module):
